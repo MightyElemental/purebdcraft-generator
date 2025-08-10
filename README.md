@@ -1,0 +1,1 @@
+An AI model that converts base textures into the style of Sphax PureBDcraft. Why? Because I'm no artist and I'm fed up of not having the textures for the mods I use.
