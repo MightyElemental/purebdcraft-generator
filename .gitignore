@@ -204,3 +204,5 @@ __marimo__/
 
 # Folders
 data/
+checkpoints/
+runs/
