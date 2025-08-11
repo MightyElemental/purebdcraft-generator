@@ -1,143 +1,83 @@
 # visualization_utils.py
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-from torchvision.utils import make_grid
 
-def _scale_to_512(img: Image.Image) -> Image.Image:
-    """Scales an image to 512x512 using nearest-neighbor interpolation."""
-    return img.resize((128,128), Image.NEAREST)
-
-def _tensor_to_pil_rgba(t: torch.Tensor) -> Image.Image:
-    """
-    Convert a 4xHxW torch tensor in range [0,1] to a PIL RGBA image.
-
-    Args:
-        t: Tensor shape (4, H, W) values in 0..1
-    Returns:
-        PIL.Image in mode 'RGBA'
-    """
-    arr = (t.clamp(0.0, 1.0).cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)  # H x W x 4
-    img = Image.fromarray(arr, mode="RGBA")
-    return _scale_to_512(img)
-
-
-def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: Optional[ImageFont.ImageFont]) -> (int, int):
-    """
-    Measure text width and height in a way that is robust across Pillow versions.
-
-    Tries the following (in order):
-      - draw.textbbox (Pillow >= 8.0)
-      - font.getsize
-      - draw.textsize (older API)
-    Returns (width, height).
-    """
+def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: Optional[ImageFont.ImageFont]) -> Tuple[int, int]:
+    """Robust text width/height measurement across Pillow versions."""
     try:
-        # modern Pillow: returns (left, top, right, bottom)
         bbox = draw.textbbox((0, 0), text, font=font)
-        w = bbox[2] - bbox[0]
-        h = bbox[3] - bbox[1]
-        return int(w), int(h)
+        return int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
     except Exception:
         pass
-
     if font is not None:
         try:
-            w, h = font.getsize(text)
-            return int(w), int(h)
+            return font.getsize(text)
         except Exception:
             pass
-
     try:
-        w, h = draw.textsize(text, font=font)
-        return int(w), int(h)
+        return draw.textsize(text, font=font)
     except Exception:
-        # fallback conservative estimate
         return int(len(text) * 6), 12
 
 
-def _draw_label_on_image(image: Image.Image, label_text: str, font: Optional[ImageFont.ImageFont] = None) -> None:
+def _tensor_to_rgba_pil(rgb: torch.Tensor, alpha: Optional[torch.Tensor]) -> Image.Image:
     """
-    Overlay a semi-opaque bar and label text at the top of the image.
-
-    The function mutates the provided PIL image.
-
-    Args:
-        image: PIL RGBA image to annotate (mutated in place)
-        label_text: text to draw
-        font: optional PIL font (fallback to default if None)
+    Convert tensors to a PIL RGBA image.
+    rgb: Tensor (3, H, W) in 0..1 (not -1..1).
+    alpha: Tensor (1, H, W) in 0..1 or None (then opaque).
+    Returns PIL.Image in RGBA.
     """
-    draw = ImageDraw.Draw(image, "RGBA")
-    if font is None:
-        try:
-            font = ImageFont.load_default()
-        except Exception:
-            font = None
-
-    tw, th = _measure_text(draw, label_text, font)
-    pad = 6
-    rect_h = th + pad * 2
-    # semi-opaque black rectangle across top for legibility
-    draw.rectangle([(0, 0), (image.width, rect_h)], fill=(0, 0, 0, 160))
-    text_x = 6
-    text_y = pad
-    # outline strokes for contrast
-    outline_color = (0, 0, 0, 255)
-    text_color = (255, 255, 255, 255)
-    # Draw outline (4 directions)
-    draw.text((text_x - 1, text_y), label_text, font=font, fill=outline_color)
-    draw.text((text_x + 1, text_y), label_text, font=font, fill=outline_color)
-    draw.text((text_x, text_y - 1), label_text, font=font, fill=outline_color)
-    draw.text((text_x, text_y + 1), label_text, font=font, fill=outline_color)
-    # main text
-    draw.text((text_x, text_y), label_text, font=font, fill=text_color)
+    # clamp and convert
+    rgb_np = (rgb.clamp(0.0, 1.0).cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)  # H x W x 3
+    if alpha is None:
+        a_np = np.full((rgb_np.shape[0], rgb_np.shape[1], 1), 255, dtype=np.uint8)
+    else:
+        a_np = (alpha.clamp(0.0, 1.0).cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)  # H x W x 1
+    rgba = np.concatenate([rgb_np, a_np], axis=2)  # H x W x 4
+    return Image.fromarray(rgba, mode="RGBA")
 
 
-def _make_triplet_image(
-    src_rgba: Image.Image,
-    real_rgba: Image.Image,
-    fake_rgba: Image.Image,
-    label_text: str,
-    font: Optional[ImageFont.ImageFont] = None,
-) -> Image.Image:
+def _prepare_image_tensor_for_pil(tensor: torch.Tensor, alpha: Optional[torch.Tensor], target_size: int) -> Image.Image:
     """
-    Create a single horizontal triplet image [src | real | fake] and overlay the label text.
-
-    Args:
-        src_rgba, real_rgba, fake_rgba: PIL RGBA images (all same size)
-        label_text: category string
-        font: optional PIL font
-    Returns:
-        PIL RGBA image of width = 3 * W and height = H (with label overlay)
+    Normalize and upsample tensors to target_size using NEAREST neighbor for both RGB and alpha.
+    Accepts rgb in either -1..1 or 0..1 and converts to 0..1.
     """
-    W, H = src_rgba.size
-    trip = Image.new("RGBA", (W * 3, H), (0, 0, 0, 0))
-    trip.paste(src_rgba, (0, 0))
-    trip.paste(real_rgba, (W, 0))
-    trip.paste(fake_rgba, (2 * W, 0))
-    _draw_label_on_image(trip, label_text, font=font)
-    return trip
+    # detect range and convert to 0..1 if necessary
+    tmax = float(tensor.max().detach().cpu())
+    tmin = float(tensor.min().detach().cpu())
+    if tmax > 1.1 or tmin < -0.9:
+        t = tensor.clamp(0.0, 1.0)
+    else:
+        if tmax > 1.0 or tmin < -0.5:
+            # assume -1..1
+            t = (tensor + 1.0) / 2.0
+        else:
+            t = tensor
 
-def make_comparison(
-    writer: SummaryWriter,
-    stage_size: int,
-    src_rgb: torch.Tensor,
-    tgt_rgb: torch.Tensor,
-    tgt_alpha: torch.Tensor,
-    fake_rgb: torch.Tensor,
-    fake_alpha: torch.Tensor,
-    global_step: int,
-    nb: int = 4,
-) -> None:
-    # log small grid: upsampled source, real rgba, fake rgba (first 4 examples)
-    up_src = F.interpolate((src_rgb[:nb] + 1) / 2.0, size=(stage_size, stage_size), mode='nearest')
-    real_rgba_grid = torch.cat([ (tgt_rgb[:nb] + 1) / 2.0, tgt_alpha[:nb] ], dim=1)
-    fake_rgba_grid = torch.cat([ (fake_rgb[:nb].detach() + 1) / 2.0, fake_alpha[:nb].detach() ], dim=1)
-    grid = make_grid(torch.cat([up_src, real_rgba_grid, fake_rgba_grid], dim=0), nrow=nb)
-    writer.add_image("comparison", grid, global_step)
+    # ensure shape B x 3 x H x W for interpolation; we expect single instance so handle dims
+    if t.dim() == 3:
+        t_rgb = t.unsqueeze(0)  # 1 x 3 x H x W
+    else:
+        t_rgb = t
+
+    # UPSAMPLE RGB using NEAREST (preserves pixels)
+    t_rgb_up = F.interpolate(t_rgb, size=(target_size, target_size), mode='nearest')[0]
+
+    # Alpha: upsample with NEAREST as well
+    if alpha is None:
+        alpha_up = None
+    else:
+        a = alpha
+        if a.dim() == 3:
+            a = a.unsqueeze(0)
+        a_up = F.interpolate(a, size=(target_size, target_size), mode='nearest')[0]
+        alpha_up = a_up
+
+    return _tensor_to_rgba_pil(t_rgb_up, alpha_up)
 
 
 def make_labeled_comparison(
@@ -152,38 +92,27 @@ def make_labeled_comparison(
     fake_alpha: torch.Tensor,
     labels: torch.Tensor,
     global_step: int,
-    nb: int = 4,
+    cols: int = 6,
+    img_px: int = 256,
     tag: str = "comparison_labeled",
 ) -> None:
     """
-    Build a labeled comparison image and write to TensorBoard.
+    Build a labeled comparison and write to TensorBoard.
 
-    Args:
-        writer: TensorBoard SummaryWriter
-        dataset: dataset instance providing cat2idx or idx2cat mapping (optional)
-        stage_size: visualisation target resolution (int)
-        src_rgb: B x 3 x Hs x Ws (in -1..1)
-        src_alpha: B x 1 x Hs x Ws (0/1)
-        tgt_rgb: B x 3 x St x St (in -1..1)
-        tgt_alpha: B x 1 x St x St (0/1)
-        fake_rgb: B x 3 x St x St (in -1..1)
-        fake_alpha: B x 1 x St x St (0..1)
-        labels: B long tensor with label indices
-        global_step: training step for TB writer
-        nb: number of examples to visualize (<= batch_size)
-        tag: TB tag name
+    - Creates a grid with `cols` columns (default 6).
+    - Each column is 3 rows: source, target, generated, followed by a text label row.
+    - All images are scaled to img_px x img_px (default 512) BEFORE adding labels.
+    - dataset: used to get idx->category mapping (dataset.idx2cat or dataset.cat2idx)
+    - src_rgb, tgt_rgb, fake_rgb: tensors B x 3 x H x W in -1..1 (or 0..1)
+    - src_alpha, tgt_alpha, fake_alpha: tensors B x 1 x H x W in 0..1 (or None)
+    - labels: B (long)
     """
+
     device = src_rgb.device
-    b = src_rgb.shape[0]
-    nb = min(nb, b)
-
-    # upsample source to target resolution (bilinear for rgb, nearest for alpha)
-    up_src_rgb = F.interpolate((src_rgb[:nb] + 1) / 2.0, size=(stage_size, stage_size), mode="bilinear", align_corners=False)
-    up_src_alpha = F.interpolate(src_alpha[:nb], size=(stage_size, stage_size), mode="nearest")
-    up_src_rgba = torch.cat([up_src_rgb, up_src_alpha], dim=1)  # nb x 4 x S x S
-
-    real_rgba = torch.cat([(tgt_rgb[:nb] + 1) / 2.0, tgt_alpha[:nb]], dim=1)
-    fake_rgba = torch.cat([(fake_rgb[:nb].detach() + 1) / 2.0, fake_alpha[:nb].detach()], dim=1)
+    batch = src_rgb.shape[0]
+    cols = min(cols, batch)
+    if cols == 0:
+        return
 
     # build idx->category mapping
     idx2cat: Dict[int, str] = {}
@@ -193,31 +122,62 @@ def make_labeled_comparison(
         cat2idx = getattr(dataset, "cat2idx")
         idx2cat = {v: k for k, v in cat2idx.items()}
 
-    # attempt to load default font
+    # choose a readable font size proportional to the image pixel size
+    font_size = max(18, img_px // 16)  # adjust divisor to tune size (smaller -> larger font)
+    font = None
+    # try common locations for a TTF (DejaVu is commonly available with Pillow)
     try:
-        font = ImageFont.load_default()
+        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
     except Exception:
-        font = None
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+        except Exception:
+            # final fallback to default (may be small)
+            try:
+                font = ImageFont.load_default()
+            except Exception:
+                font = None
 
-    pil_triplets = []
-    for i in range(nb):
-        src_pil = _tensor_to_pil_rgba(up_src_rgba[i])
-        real_pil = _tensor_to_pil_rgba(real_rgba[i])
-        fake_pil = _tensor_to_pil_rgba(fake_rgba[i])
-        label_idx = int(labels[i].item())
+    # prepare PIL triplet columns
+    columns = []
+    for i in range(cols):
+        # compose PIL images, scaled to img_px
+        src_pil = _prepare_image_tensor_for_pil(src_rgb[i], src_alpha[i] if src_alpha is not None else None, img_px)
+        tgt_pil = _prepare_image_tensor_for_pil(tgt_rgb[i], tgt_alpha[i] if tgt_alpha is not None else None, img_px)
+        fake_pil = _prepare_image_tensor_for_pil(fake_rgb[i].detach(), fake_alpha[i].detach() if fake_alpha is not None else None, img_px)
+
+        # create column: vertical stack (source, target, generated), white background
+        column_h = img_px * 3
+        label_area_h = max(32, img_px // 16)  # reasonable label area
+        total_h = column_h + label_area_h
+        col_img = Image.new("RGBA", (img_px, total_h), (255, 255, 255, 255))
+
+        # paste images with no overlay
+        col_img.paste(src_pil, (0, 0))
+        col_img.paste(tgt_pil, (0, img_px))
+        col_img.paste(fake_pil, (0, img_px * 2))
+
+        # draw label in the label area (centered)
+        draw = ImageDraw.Draw(col_img)
+        label_idx = int(labels[i].item()) if isinstance(labels, torch.Tensor) else int(labels[i])
         label_text = idx2cat.get(label_idx, str(label_idx))
-        trip = _make_triplet_image(src_pil, real_pil, fake_pil, label_text=label_text, font=font)
-        pil_triplets.append(trip)
+        tw, th = _measure_text(draw, label_text, font)
+        text_x = max(0, (img_px - tw) // 2)
+        text_y = column_h + (label_area_h - th) // 2
+        text_color = (0, 0, 0, 255)
+        draw.text((text_x, text_y), label_text, font=font, fill=text_color)
 
-    # compose horizontally
-    total_w = pil_triplets[0].width * nb
-    total_h = pil_triplets[0].height
-    canvas = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
-    for i, im in enumerate(pil_triplets):
-        canvas.paste(im, (i * im.width, 0))
+        columns.append(col_img)
 
-    # convert canvas to tensor CHW in 0..1
-    canvas_arr = np.array(canvas).astype(np.float32) / 255.0  # H x W x 4
-    canvas_tensor = torch.from_numpy(canvas_arr).permute(2, 0, 1)  # 4 x H x W
+    # compose final canvas horizontally
+    final_w = img_px * cols
+    final_h = columns[0].height
+    canvas = Image.new("RGBA", (final_w, final_h), (255, 255, 255, 255))
+    for idx, col in enumerate(columns):
+        canvas.paste(col, (idx * img_px, 0))
 
-    writer.add_image(tag + f"_stage{stage_size}", canvas_tensor, global_step)
+    # convert to tensor CHW in 0..1
+    arr = np.array(canvas).astype(np.float32) / 255.0  # H x W x 4
+    tensor = torch.from_numpy(arr).permute(2, 0, 1)  # 4 x H x W
+
+    writer.add_image(f"{tag}_stage{stage_size}", tensor, global_step)

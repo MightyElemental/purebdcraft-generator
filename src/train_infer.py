@@ -14,7 +14,6 @@ from typing import Dict, Optional, Tuple, Any
 import os
 import argparse
 from pathlib import Path
-import math
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
@@ -73,6 +72,7 @@ def train_stage(
     disc: PatchDiscriminator,
     g_opt: optim.Optimizer,
     d_opt: optim.Optimizer,
+    loader: DataLoader,
     batch_size: int = 8,
     epochs: int = 2,
     num_workers: int = 10,
@@ -89,16 +89,18 @@ def train_stage(
 ) -> None:
     """
     Train the model for a given stage size (target resolution).
-    The dataset will include only samples whose original target >= stage_size (handled by dataset constructor).
+
+    NOTE: `loader` is required and must be created *outside* this function.
+    The function will use `loader.dataset` for dataset-level info (e.g. category names).
     """
     writer = SummaryWriter(log_dir=os.path.join(log_dir, f"stage_{stage_size}"))
-    dataset = PairedSourceTargetDataset(source_root=source_dir, target_root=target_dir, target_size=stage_size)
-    print(f"loaded {len(dataset)} image pairs")
-    if len(dataset) == 0:
-        print(f"No samples for stage {stage_size}. Skipping.")
-        return
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    generator.train(); disc.train()
+
+    # Use the externally-provided DataLoader and its underlying dataset
+    dataset = loader.dataset
+    print(f"using provided DataLoader with {len(dataset)} active pairs for stage {stage_size}")
+
+    generator.train()
+    disc.train()
     if perceptual is not None:
         perceptual.to(device)
 
@@ -190,8 +192,18 @@ def train_stage(
                     fake_alpha=fake_alpha,
                     labels=labels,
                     global_step=global_step,
-                    nb=4,
                 )
+                # make_comparison(
+                #     writer=writer,
+                #     stage_size=stage_size,
+                #     src_rgb=src_rgb,
+                #     tgt_rgb=tgt_rgb,
+                #     tgt_alpha=tgt_alpha,
+                #     fake_rgb=fake_rgb,
+                #     fake_alpha=fake_alpha,
+                #     global_step=global_step,
+                #     nb=4,
+                # )
 
 
             global_step += 1
@@ -285,19 +297,27 @@ def main():
 
     device = torch.device(args.device)
 
-    # stages (target sizes). Dataset will include only samples >= stage_size (handled by dataset)
-    stages = [32, 64, 128, 256, 512]  # start at 32 (16 trivial)
-    # build models for final size (largest) and reuse
-    generator = Generator(n_labels=args.n_labels, z_dim=args.z_dim, base_ch=64, out_size=stages[-1], in_channels=4).to(device)
-    # NOTE: create discriminator once and reuse across stages
-    disc = PatchDiscriminator(in_ch=8, base=64, n_labels=args.n_labels).to(device)
+    # stages (target sizes). We'll create dataset once and reuse/update it per stage.
+    stages = [32, 64, 128, 256, 512]
 
-    # Try to load discriminator/generator states from latest checkpoint (if present).
+    # build dataset once (scans all pairs and builds category map). We'll call update_stage(stage) per stage.
+    dataset = PairedSourceTargetDataset(
+        source_root=args.source_dir,
+        target_root=args.target_dir,
+        source_size=16,
+        initial_stage_size=stages[0]
+    )
+    n_labels = max(1, len(dataset.cat2idx))
+    print(f"Found {len(dataset.pairs)} total pairs and {n_labels} categories.")
+
+    # create discriminator once with correct n_labels
+    disc = PatchDiscriminator(in_ch=8, base=64, n_labels=n_labels).to(device)
+
+    # Try to load discriminator state from latest checkpoint (if present).
     latest = find_latest_checkpoint(args.checkpoint_dir)
     ckpt = None
     if latest:
         ckpt = torch.load(latest, map_location=device)
-        # load discriminator state if available
         if 'disc_state' in ckpt:
             try:
                 disc.load_state_dict(ckpt['disc_state'], strict=False)
@@ -313,17 +333,15 @@ def main():
 
         # Progressive training: instantiate a generator per stage
         for stage in stages:
-            print("Beginning stage", stage)
+            # update dataset for this stage and build a DataLoader (no re-scan)
+            dataset.update_stage(stage)
+            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+            print(f"Beginning stage {stage}; {len(dataset.active_pairs)} pairs available for this stage.")
 
-            # Skip trivial 16 stage (if present) — dataset and generator expect meaningful sizes
-            if stage <= 16:
-                continue
+            # create generator for this stage's output size with correct n_labels
+            generator = Generator(n_labels=n_labels, z_dim=args.z_dim, base_ch=64, out_size=stage, in_channels=4).to(device)
 
-            # create generator for this stage's output size
-            generator = Generator(n_labels=args.n_labels, z_dim=args.z_dim, base_ch=64, out_size=stage, in_channels=4)
-            generator = generator.to(device)
-
-            # If we have a checkpoint, attempt to load matching generator params (strict=False).
+            # attempt to partially load weights from checkpoint (if it exists)
             if ckpt is not None and 'generator_state' in ckpt:
                 try:
                     generator.load_state_dict(ckpt['generator_state'], strict=False)
@@ -331,10 +349,9 @@ def main():
                 except Exception as e:
                     print("Warning: could not load generator weights into stage model:", e)
 
-            # Generator optimizer (new optimizer for the new generator instance)
             g_opt = optim.Adam(generator.parameters(), lr=args.lr, betas=(0.5, 0.999))
 
-            # Train this stage (train_stage expects generator and disc objects)
+            # call train_stage with the external loader (loader is required)
             train_stage(
                 stage_size=stage,
                 source_dir=args.source_dir,
@@ -344,6 +361,7 @@ def main():
                 disc=disc,
                 g_opt=g_opt,
                 d_opt=d_opt,
+                loader=loader,
                 batch_size=args.batch_size,
                 epochs=args.epochs_per_stage,
                 num_workers=args.num_workers,
@@ -373,8 +391,7 @@ def main():
             print("No input provided. Use --input <image_or_folder> or --train to train.")
             return
         # build a mapping of categories from dataset (to know label indices)
-        ds = PairedSourceTargetDataset(source_root=args.source_dir, target_root=args.target_dir, target_size=512)
-        cat2idx = ds.cat2idx
+        cat2idx = dataset.cat2idx
         if os.path.isdir(args.input):
             out_root = ensure_out_dir(args.input)
             for root, _, files in os.walk(args.input):
