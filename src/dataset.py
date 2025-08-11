@@ -2,22 +2,22 @@
 from typing import Callable, Dict, List, Optional, Tuple
 import os
 from pathlib import Path
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision import transforms
+import numpy as np
 
 
 def _is_image_file(fname: str) -> bool:
     """Return True if filename looks like an image."""
     return fname.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))
 
-
 class PairedSourceTargetDataset(Dataset):
     """
     Dataset that pairs files by relative path between `source_root` and `target_root`.
-    Category label is inferred as the first directory in the relative path (e.g. `source/<category>/...`).
+    Category label is inferred as the first directory in the relative path (e.g. `source/<modname>/<category>/...`).
 
     Both source and target are loaded as RGBA (if available). Alpha is converted to a
     binary mask (0.0 or 1.0) and returned separately. Source is expected to be low-res
@@ -91,7 +91,8 @@ class PairedSourceTargetDataset(Dataset):
                 if len(parts) < 2:
                     # enforce at least category/filename relative layout
                     continue
-                category = parts[0]
+                category = parts[0] # TODO: Changing this to a 1 breaks it????
+                # print(category)
                 if self.allowed_categories is not None and category not in self.allowed_categories:
                     continue
                 abs_target = self.target_root / rel_path
@@ -106,24 +107,43 @@ class PairedSourceTargetDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pairs)
 
-    def _load_rgba(self, path: Path) -> Tuple[Image.Image, Optional[Image.Image]]:
+    def _load_rgba(self, path: Path) -> Optional[Tuple[Image.Image, Image.Image]]:
         """
-        Load an image as RGBA. Returns (rgb_pil, alpha_pil) where alpha_pil is single-channel 'L' image.
-        If the source has no alpha, alpha_pil will be a white mask.
+        Loads an image from a path and splits it into RGB and alpha channels.
+
+        Args:
+            path (str): Path to the image file.
+
+        Returns:
+            Optional[Tuple[Image.Image, Image.Image]]:
+                Tuple containing the RGB PIL image and alpha channel PIL image,
+                or None if the image could not be loaded or converted.
         """
-        img = Image.open(path).convert("RGBA")
-        r, g, b, a = img.split()
-        rgb = Image.merge("RGB", (r, g, b))
-        alpha = a  # 'L' mode, 0..255
-        return rgb, alpha
+        try:
+            img = Image.open(path).convert("RGBA")
+            rgb_img = img.convert("RGB")
+            alpha_img = img.getchannel("A")
+            return rgb_img, alpha_img
+        except (UnidentifiedImageError, OSError) as e:
+            # Log and skip this file
+            print(f"[WARN] Skipping unreadable image: {path} ({e})")
+            return None
 
     def __getitem__(self, index: int):
         src_path, tgt_path, category = self.pairs[index]
         rel_path = src_path.relative_to(self.source_root).as_posix()
 
         # load source RGBA
-        src_rgb_pil, src_alpha_pil = self._load_rgba(src_path)
-        tgt_rgb_pil, tgt_alpha_pil = self._load_rgba(tgt_path)
+        src_data = self._load_rgba(src_path)
+        tgt_data = self._load_rgba(tgt_path)
+
+        if src_data is None or tgt_data is None:
+            # Skip to next valid item
+            # This recursion ensures we don't crash but will skip bad pairs
+            return self.__getitem__((index + 1) % len(self))
+
+        src_rgb_pil, src_alpha_pil = src_data
+        tgt_rgb_pil, tgt_alpha_pil = tgt_data
 
         # apply transforms
         src_rgb_t = self.transform_source_rgb(src_rgb_pil)  # 3 x Hs x Ws in 0..1
