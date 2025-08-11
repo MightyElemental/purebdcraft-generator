@@ -18,7 +18,7 @@ import math
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
-from torchvision.utils import make_grid, save_image
+from torchvision.utils import save_image
 from torch.nn import BCEWithLogitsLoss
 from torch.nn.functional import interpolate
 from tensorboardX import SummaryWriter
@@ -27,6 +27,7 @@ import torchvision.transforms.functional as TF
 
 from dataset import PairedSourceTargetDataset
 from models import Generator, PatchDiscriminator, PerceptualLoss
+from visualization_utils import make_labeled_comparison
 
 # -------------------------
 # Helpers
@@ -74,7 +75,7 @@ def train_stage(
     d_opt: optim.Optimizer,
     batch_size: int = 8,
     epochs: int = 2,
-    num_workers: int = 4,
+    num_workers: int = 10,
     log_dir: str = "./runs",
     log_steps: int = 50,
     log_images_every: int = 200,
@@ -92,6 +93,7 @@ def train_stage(
     """
     writer = SummaryWriter(log_dir=os.path.join(log_dir, f"stage_{stage_size}"))
     dataset = PairedSourceTargetDataset(source_root=source_dir, target_root=target_dir, target_size=stage_size)
+    print(f"loaded {len(dataset)} image pairs")
     if len(dataset) == 0:
         print(f"No samples for stage {stage_size}. Skipping.")
         return
@@ -176,13 +178,21 @@ def train_stage(
                     writer.add_scalar("perceptual", perc_loss.item(), global_step)
 
             if global_step % log_images_every == 0:
-                # log small grid: upsampled source, real rgba, fake rgba (first 4 examples)
-                nb = min(4, b)
-                up_src = interpolate((src_rgb[:nb] + 1) / 2.0, size=(stage_size, stage_size), mode='nearest')
-                real_rgba_grid = torch.cat([ (tgt_rgb[:nb] + 1) / 2.0, tgt_alpha[:nb] ], dim=1)
-                fake_rgba_grid = torch.cat([ (fake_rgb[:nb].detach() + 1) / 2.0, fake_alpha[:nb].detach() ], dim=1)
-                grid = make_grid(torch.cat([up_src, real_rgba_grid, fake_rgba_grid], dim=0), nrow=nb)
-                writer.add_image("comparison", grid, global_step)
+                make_labeled_comparison(
+                    writer=writer,
+                    dataset=dataset,
+                    stage_size=stage_size,
+                    src_rgb=src_rgb,
+                    src_alpha=src_alpha,
+                    tgt_rgb=tgt_rgb,
+                    tgt_alpha=tgt_alpha,
+                    fake_rgb=fake_rgb,
+                    fake_alpha=fake_alpha,
+                    labels=labels,
+                    global_step=global_step,
+                    nb=4,
+                )
+
 
             global_step += 1
 
@@ -278,28 +288,53 @@ def main():
     # stages (target sizes). Dataset will include only samples >= stage_size (handled by dataset)
     stages = [32, 64, 128, 256, 512]  # start at 32 (16 trivial)
     # build models for final size (largest) and reuse
-    generator = Generator(n_labels=args.n_labels, z_dim=args.z_dim, base_ch=64, out_size=stages[-1], in_channels=4)
-    disc = PatchDiscriminator(in_ch=8, base=64, n_labels=args.n_labels)
-    generator.to(device); disc.to(device)
+    generator = Generator(n_labels=args.n_labels, z_dim=args.z_dim, base_ch=64, out_size=stages[-1], in_channels=4).to(device)
+    # NOTE: create discriminator once and reuse across stages
+    disc = PatchDiscriminator(in_ch=8, base=64, n_labels=args.n_labels).to(device)
 
+    # Try to load discriminator/generator states from latest checkpoint (if present).
     latest = find_latest_checkpoint(args.checkpoint_dir)
+    ckpt = None
     if latest:
         ckpt = torch.load(latest, map_location=device)
-        try:
-            if "generator_state" in ckpt:
-                generator.load_state_dict(ckpt["generator_state"], strict=False)
-            if "disc_state" in ckpt:
-                disc.load_state_dict(ckpt["disc_state"], strict=False)
-            print("Loaded checkpoint", latest)
-        except Exception as e:
-            print("Warning: could not fully load checkpoint:", e)
+        # load discriminator state if available
+        if 'disc_state' in ckpt:
+            try:
+                disc.load_state_dict(ckpt['disc_state'], strict=False)
+                print("Loaded discriminator state from checkpoint.")
+            except Exception as e:
+                print("Warning: could not fully load discriminator state:", e)
 
     if args.train:
-        g_opt = optim.Adam(generator.parameters(), lr=args.lr, betas=(0.5, 0.999))
+        # Discriminator optimizer (single optimizer reused across stages)
         d_opt = optim.Adam(disc.parameters(), lr=args.lr, betas=(0.5, 0.999))
+
         perceptual = PerceptualLoss(device) if args.perceptual else None
+
+        # Progressive training: instantiate a generator per stage
         for stage in stages:
             print("Beginning stage", stage)
+
+            # Skip trivial 16 stage (if present) — dataset and generator expect meaningful sizes
+            if stage <= 16:
+                continue
+
+            # create generator for this stage's output size
+            generator = Generator(n_labels=args.n_labels, z_dim=args.z_dim, base_ch=64, out_size=stage, in_channels=4)
+            generator = generator.to(device)
+
+            # If we have a checkpoint, attempt to load matching generator params (strict=False).
+            if ckpt is not None and 'generator_state' in ckpt:
+                try:
+                    generator.load_state_dict(ckpt['generator_state'], strict=False)
+                    print(f"Partially loaded generator weights into stage-{stage} model (where keys matched).")
+                except Exception as e:
+                    print("Warning: could not load generator weights into stage model:", e)
+
+            # Generator optimizer (new optimizer for the new generator instance)
+            g_opt = optim.Adam(generator.parameters(), lr=args.lr, betas=(0.5, 0.999))
+
+            # Train this stage (train_stage expects generator and disc objects)
             train_stage(
                 stage_size=stage,
                 source_dir=args.source_dir,
@@ -323,6 +358,14 @@ def main():
                 perceptual=perceptual,
                 checkpoint_dir=args.checkpoint_dir,
             )
+
+            # After finishing the stage, save the generator for this stage explicitly
+            save_ckpt({
+                'stage_size': stage,
+                'generator_state': generator.state_dict(),
+                'disc_state': disc.state_dict(),
+            }, args.checkpoint_dir, name=f'stage_{stage}.pt')
+
         print("Training complete.")
     else:
         # inference
